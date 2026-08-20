@@ -36,8 +36,8 @@ export class OpenRouterService {
   }
 
   async generateStructured<T>(
-    userPrompt: string,
     systemPrompt: string,
+    userPrompt: string,
     schema: z.ZodSchema<T>,
   ) {
     try {

@@ -1,393 +1,252 @@
 # Song Recommender with LangGraph Memory
 
-Demonstration of **LangGraph memory persistence** using conversational AI to recommend music based on user preferences. This project showcases how to build stateful, multi-turn conversations where the AI remembers context across messages.
+This project is a conversational music recommender built with LangGraph and structured LLM responses. The main idea is simple: the assistant keeps track of the user context over time, extracts user preferences from the conversation, persists them, and uses them to make better song recommendations without losing the thread of the dialogue.
 
-## 🎯 Goals
+The project is intentionally small and explicit: each graph node has a clear responsibility, and the flow is designed to be easy to remember and explain.
 
-This project exemplifies:
-- **Memory Persistence**: Using LangGraph's `MemorySaver` for conversation history
-- **Thread-based Sessions**: Separate conversation contexts per user/session
-- **Conversational AI**: Natural dialogue that asks questions and builds context
-- **Minimal Architecture**: Simple single-node graph focusing on memory
-- **Real LLM Integration**: Live testing with actual OpenRouter API calls
+## Main goal
 
-## Features
+The system is not just a "chatbot" that answers a single message. It is a stateful recommendation flow that:
 
-- 🎵 **Smart Recommendations**: AI suggests songs based on learned preferences
-- 💬 **Conversational Memory**: Remembers user name, favorite bands, genres, etc.
-- 🔄 **Thread Isolation**: Different users/sessions maintain separate memories
-- 📝 **Dynamic Learning**: Updates understanding as conversation progresses
-- 🧪 **Integration Tests**: Real API tests verify memory persistence
+- understands conversational context,
+- extracts new user preferences from explicit statements,
+- stores those preferences safely,
+- summarizes long conversations to keep the context compact,
+- recommends specific songs based on known tastes.
 
-## Architecture
+## Graph flow
 
-### LangGraph Workflow
+The graph is defined in [src/graph/graph.ts](src/graph/graph.ts).
 
-https://docs.langchain.com/oss/javascript/integrations/vectorstores/libsql
-https://docs.langchain.com/oss/javascript/langgraph/persistence#memory-store
+```text
+START
+ ↓
+chat
+ ↓
+routeAfterChat
+ ├─ if extractedPreferences exists → savePreferences
+ ├─ else if needsSummarization → summarize
+ └─ else → END
 
-```
-START → chat (with memory) → END
-         ↓
-   Checkpointer persists state
-   across invocations
-```
+savePreferences
+ ↓
+routeAfterSavePreferences
+ ├─ if needsSummarization → summarize
+ └─ else → END
 
-### Project Structure
-
-```
-src/
-  ├── config.ts                     # Configuration with memory settings
-  ├── index.ts                      # Interactive CLI chat interface
-  ├── graph/
-  │   ├── graph.ts                  # Simple graph with one chat node
-  │   └── factory.ts                # Graph builder with memory service
-  ├── services/
-  │   ├── memory-service.ts         # MemorySaver initialization
-  │   └── openrouter-service.ts     # LLM client with chat method
-  └── utils/
-      └── prompt-loader.ts          # Template loading
-prompts/
-  └── system.txt                    # System prompt for song recommender
-tests/
-  └── chat-memory.test.ts           # Integration tests with real LLM
+summarize
+ ↓
+END
 ```
 
-## How Memory Works
+### State and purpose
 
-This project demonstrates **two types of memory**:
+The graph state contains:
 
-### 1. Conversation Memory (MemorySaver)
-- **Thread ID**: Each conversation has a unique `thread_id` for isolation
-- **In-Memory Storage**: Conversation history stored in memory during the session
-- **Automatic Replay**: Previous messages included when invoking with same `thread_id`
+- `messages`: the message history used by LangGraph
+- `userContext`: the remembered preference summary from the DB
+- `extractedPreferences`: new structured info extracted from the current user message
+- `needsSummarization`: signal that the conversation is long enough to compact
+- `conversationSummary`: the compressed version of the conversation
+- `userId`: user/session identifier
 
-### 2. User Preferences (LibSQL Vector Store)
-- **Vector Embeddings**: User preferences stored as embedded documents using OpenAI embeddings
-- **Semantic Search**: Uses `@libsql/client` with vector similarity for intelligent matching
-- **Persistent Storage**: Preferences persisted to SQLite database across restarts
-- **Document Structure**: Each preference stored with rich metadata (name, bands, genres, age, mood)
+The state schema lives in [src/graph/graph.ts](src/graph/graph.ts) and is built with Zod, which makes the structure explicit and safe.
 
-**Why Vector Store for Preferences?**
-- Better semantic understanding of user taste
-- Can find similar music preferences across users
-- Enables more intelligent recommendations based on embedded meaning
-- Scalable approach for large user bases
+## Node-by-node flow
 
-This demonstrates production-ready patterns:
-- Conversation state for short-term context
-- Vector store for long-term, searchable user data
-- Hybrid memory approach for AI applications
+### 1) chat node
 
-```typescript
-// First message
-await graph.invoke(
-  { messages: [new HumanMessage("Hi! I'm Alex")] },
-  { configurable: { thread_id: "user-123" } }
-);
+Implemented in [src/graph/nodes/chatNode.ts](src/graph/nodes/chatNode.ts).
 
-// Second message - AI remembers "Alex" from previous message
-await graph.invoke(
-  { messages: [new HumanMessage("Recommend some songs")] },
-  { configurable: { thread_id: "user-123" } }
-);
+This is the main orchestration step:
+
+- loads the current `userContext` from the user profile summary if available,
+- builds a prompt with:
+ - a system prompt describing the assistant personality and extraction rules,
+ - the current conversation history,
+ - the actual latest user message,
+- calls the LLM with a structured schema (`ChatResponseSchema`),
+- receives a response shaped like:
+ - `message`: the conversational answer to the user,
+ - `preferences`: extracted new data from the user's statement,
+ - `shouldSavePreferences`: boolean to decide whether to persist changes.
+
+The key logic is:
+
+```ts
+const totalMessages = state.messages.length;
+const needsSummarization = totalMessages >= config.maxMessagesToSummary;
+```
+
+This means the conversation can be compacted after the message count threshold is reached.
+
+### 2) routeAfterChat
+
+Defined in [src/graph/nodes/edgeConditions.ts](src/graph/nodes/edgeConditions.ts).
+
+The decision rule is:
+
+- if there are new extracted preferences: move to `savePreferences`
+- else if summarization is needed: move to `summarize`
+- otherwise end
+
+This keeps the graph responsive and ensures preferences are stored before the conversation is summarized.
+
+### 3) savePreferences node
+
+Implemented in [src/graph/nodes/savePreferencesNode.ts](src/graph/nodes/savePreferencesNode.ts).
+
+This node merges the extracted user preferences into the persistent profile:
+
+- `preferencesService.mergePreferences(userId, state.extractedPreferences)`
+- then clears the temporary extracted field so the state does not re-save on the next pass
+
+This is the place where user-supplied facts become durable personal context.
+
+### 4) summarize node
+
+Implemented in [src/graph/nodes/summarizationNode.ts](src/graph/nodes/summarizationNode.ts).
+
+When the conversation gets too long, the assistant creates a short summary of the relevant music preferences and context:
+
+- it reads the whole conversation history,
+- asks the model to consolidate it into a structured summary,
+- stores that summary with the user,
+- removes older messages from the working state,
+- keeps the memory light but semantically useful.
+
+This is the main strategy for avoiding prompt bloat while preserving continuity.
+
+## Persistence architecture
+
+### Memory service
+
+The memory layer is created in [src/services/memoryService.ts](src/services/memoryService.ts).
+
+It uses:
+
+- `PostgresSaver` for LangGraph checkpointing / conversation state persistence
+- `PostgresStore` for memory storage
+
+This gives each user/thread isolation, while keeping the model state recoverable across runs.
+
+### Preferences service
+
+The user profile is persisted through [src/services/preferencesService.ts](src/services/preferencesService.ts), which uses SQLite via `better-sqlite3` and `knex`.
+
+It stores structured information such as:
+
+- name
+- age
+- favorite genres
+- favorite bands/artists
+- key preferences
+- important context
+
+The function `getBasicInfo(userId)` reconstructs a compact user summary to inject back into the prompt as `userContext`.
+
+## Prompt design and extraction rules
+
+The most important design pieces are in [src/prompts/v1/chatResponse.ts](src/prompts/v1/chatResponse.ts) and [src/prompts/v1/summarization.ts](src/prompts/v1/summarization.ts).
+
+### Structured output
+
+The chat node does not rely on free text alone. It expects a schema:
+
+```ts
+ChatResponseSchema = {
+ message: string,
+ preferences?: UserPreferences,
+ shouldSavePreferences: boolean,
+}
+```
+
+That schema ensures the model returns a consistent answer and explicit save/no-save decision.
+
+### Important extraction rule
+
+One of the core instructions from the project notes is very important:
+
+- `shouldSavePreferences` must be `true` only when the user explicitly shares new personal information in the current message.
+- The assistant must not treat recommendations it made as user preferences.
+- Example: if the AI says "try Foo Fighters", that does not mean the user likes Foo Fighters.
+
+This rule avoids a classic failure mode in memory agents: contaminated memory from AI-generated suggestions.
+
+### Summary rule
+
+The summary prompt is designed to:
+
+- merge duplicates,
+- keep explicit user preferences,
+- preserve relevant context,
+- avoid re-adding recommendations that were suggested by the assistant rather than declared by the user.
+
+## Runtime flow from the CLI
+
+The entry point is [src/index.ts](src/index.ts).
+
+At runtime:
+
+1. the graph is built through [src/graph/factory.ts](src/graph/factory.ts),
+2. a user/thread ID is created,
+3. existing memory is loaded from the store,
+4. the conversation starts with a greeting message,
+5. each new user input invokes the graph with the same thread config,
+6. the assistant answers while remembering previous context.
+
+The CLI can be started with:
+
+```bash
+npm run chat:igorRomero
+```
+
+or
+
+```bash
+npm run chat:ana
 ```
 
 ## Setup
 
-1. **Install dependencies**:
-   ```bash
-   npm install
-   ```
-
-2. **Configure environment** (`.env`):
-   ```bash
-   OPENROUTER_API_KEY=your_openrouter_key_here
-   OPENROUTER_HTTP_REFERER=http://localhost:3000
-   OPENROUTER_X_TITLE=Song Recommender
-   OPENAI_API_KEY=your_openai_key_here  # For embeddings
-   ```
-
-3. **Run the chat interface**:
-   ```bash
-   npm run chat
-   ```
-
-4. **Run tests**:
-   ```bash
-   npm test
-   ```
-
-## Example Conversation
-
-```
-You: Hi!
-AI: Hello there! It's great to see you! What's your name, and what kind of music do you enjoy?
-
-You: My name is Alex and I love rock music, especially Foo Fighters.
-AI: Nice to meet you, Alex! Foo Fighters are amazing! Do you have any other favorite bands or specific rock subgenres you enjoy?
-
-You: Can you recommend some songs for me?
-AI: Absolutely, Alex! Since you love Foo Fighters, you might enjoy "Everlong" for its powerful energy...
-```
-
-## Key Learnings
-
-- **Stateful Conversations**: Memory enables natural multi-turn dialogues
-- **Thread Management**: Separate threads isolate different users/sessions
-- **Simple Architecture**: One node + memory checkpointer is all you need
-- **Testing Strategy**: Integration tests with real LLM verify behavior
-
-## Next Steps
-
-- Add SQLite/PostgreSQL persistence for production use
-- Implement conversation summarization for long histories
-- Add structured data extraction to store preferences explicitly
-- Build web interface with session management
-  └── v1/
-      ├── plan.json           # Outline generation prompt
-      ├── draft.json          # Section writing prompt
-      └── review.json         # Quality review prompt
-tests/
-  └── article-generator.test.ts  # Real API integration test
-```
-  │   ├── graph.ts          # StateGraph definition with co-located types
-  │   ├── factory.ts        # Graph creation factory
-  │   └── nodes/            # LangGraph nodes (workflow steps)
-  │       ├── outline.node.ts    # Generate article structure + parsing
-  │       ├── research.node.ts   # Research sections in parallel
-  │       ├── write.node.ts      # Write sections + assembly
-  │       └── review.node.ts     # Polish final article
-  ├── services/
-  │   └── openrouter-service.ts  # OpenRouter SDK wrapper (implements LLMClient)
-  └── utils/
-      └── prompt-loader.ts  # Load prompts from template files
-
-prompts/                    # Prompt templates with variables
-  ├── outline.txt           # Section structure generation
-  ├── research.txt          # Research individual sections
-  ├── write-section.txt     # Write section content
-  └── review.txt            # Review and improve
-
-tests/
-  └── article-generator.test.ts  # Graph workflow tests
-```
-
-## Installation
+1. Install dependencies:
 
 ```bash
 npm install
 ```
 
-## Configuration
-
-Create `.env` file:
+2. Create a `.env` file with your OpenRouter credentials:
 
 ```env
-# OpenRouter Configuration (required)
-OPENROUTER_API_KEY=sk-or-v1-...
-OPENROUTER_MODEL=anthropic/claude-3.5-sonnet
-OPENROUTER_HTTP_REFERER=https://your-site.com
-OPENROUTER_X_TITLE=Article Generator
-
-# Model Configuration
-MODEL_TIMEOUT=60000
-MODEL_MAX_RETRIES=3
-
-# Article Configuration
-MIN_SECTIONS=3
-MAX_SECTIONS=8
-TARGET_WORDS_PER_SECTION=200
-
-# Logging
-LOG_LEVEL=info
+OPENROUTER_API_KEY=your_key_here
 ```
 
-## Usage
-
-### Generate Article
+3. Start the app:
 
 ```bash
-# Using topic flag
-npm run generate -- --topic "Test-Driven Development in TypeScript"
-
-# With custom output path
-npm run generate -- --topic "Docker Best Practices" --output my-article.md
+npm run chat:igorRomero
 ```
 
-### Run Tests
+4. Optional: run tests:
 
 ```bash
 npm test
 ```
 
-## How It Works
+## Project notes / implementation memory
 
-### 1. Outline Node
+These are the key ideas to keep in mind when revisiting the project:
 
-Generates article structure:
-- Title
-- Introduction
-- Sections with key points
-- Conclusion
+- The graph is a small but intentional workflow: `chat -> condition -> savePreferences/summarize -> end`.
+- The assistant is rewarded for explicit user declarations, not for implicit inferences.
+- The conversation summary is there to prevent prompt explosion.
+- Memory should preserve personality and preferences, not the full transcript forever.
+- The assistant is opinionated, warm, and recommendation-driven, but it must remain strict about what counts as a real user preference.
 
-**State Updates**: `outline`, `currentStep`
+## Short mental model
 
-### 2. Research Node
+If I had to describe this project in one sentence:
 
-Researches all sections **in parallel**:
-```typescript
-const researchPromises = sections.map(section =>
-  llmClient.generate(researchPrompt)
-);
-const results = await Promise.all(researchPromises);
-```
+> It is a LangGraph recommendation agent that keeps a running user profile, updates it only from explicit user statements, and summarizes long histories so recommendations remain personalized without growing the prompt unbounded.
 
-**State Updates**: `researchResults`, `currentStep`
 
-### 3. Write Sections Node
-
-Writes each section **sequentially** using research:
-- Loops through sections
-- Uses section research + key points
-- Calculates word count
-- Builds draft article
-
-**State Updates**: `sections`, `draftArticle`, `totalWords`, `currentStep`
-
-### 4. Review Node
-
-Reviews and improves final article:
-- Checks tone and style
-- Improves transitions
-- Ensures consistency
-- Polishes language
-
-**State Updates**: `finalArticle`, `currentStep`
-
-## LangGraph Concepts
-
-### StateGraph
-
-Defines the workflow with typed state:
-```typescript
-const ArticleStateAnnotation = Annotation.Root({
-  topic: Annotation<string>,
-  outline: Annotation<any>,
-  researchResults: Annotation<string[]>,
-  sections: Annotation<any[]>,
-  draftArticle: Annotation<string>,
-  finalArticle: Annotation<string>,
-  totalWords: Annotation<number>,
-  currentStep: Annotation<string>,
-});
-```
-
-### Node Functions
-
-Each node receives state and returns partial state updates:
-```typescript
-export const createOutlineNode = (llmClient: LLMClient) => {
-  return async (state: GraphState): Promise<Partial<GraphState>> => {
-    const outline = await generateOutline(state.topic);
-    return {
-      outline,
-      currentStep: 'outline_completed',
-    };
-  };
-};
-```
-
-### Graph Construction
-
-```typescript
-const workflow = new StateGraph({ stateSchema: ArticleStateAnnotation })
-  .addNode('generateOutline', outlineNode)
-  .addNode('conductResearch', researchNode)
-  .addNode('writeSections', writeSectionsNode)
-  .addNode('reviewArticle', reviewNode)
-  .addEdge(START, 'generateOutline')
-  .addEdge('generateOutline', 'conductResearch')
-  .addEdge('conductResearch', 'writeSections')
-  .addEdge('writeSections', 'reviewArticle')
-  .addEdge('reviewArticle', END);
-
-return workflow.compile();
-```
-
-## Testing Strategy
-
-Uses **MockLLMClient** with deterministic responses:
-
-```typescript
-class MockLLMClient implements LLMClient {
-  responses: Map<string, string>;
-
-  async generate(prompt: string): Promise<string> {
-    if (prompt.includes('outline')) return mockOutline;
-    if (prompt.includes('Research')) return mockResearch;
-    if (prompt.includes('Write')) return mockSection;
-    if (prompt.includes('Review')) return mockReview;
-  }
-}
-```
-
-Tests verify:
-- ✅ Complete article generation through graph
-- ✅ Multiple LLM calls in chain
-- ✅ Correct state flow through all nodes
-- ✅ Word count calculation
-
-## Key Patterns
-
-### Single Responsibility Principle
-
-- **Nodes**: One transformation per node
-- **Services**: LLM interactions only
-- **Utils**: Reusable helpers (prompt loading)
-- **Config**: Environment management
-
-### Dependency Injection
-
-Nodes receive dependencies as parameters:
-```typescript
-createOutlineNode(llmClient: LLMClient, config: ArticleConfig)
-```
-
-### Immutable State
-
-Nodes return new state objects, never mutate:
-```typescript
-return {
-  ...state,
-  outline: newOutline,
-};
-```
-
-### Prompt Templates
-
-Prompts stored in files, not code:
-```typescript
-const prompt = await PromptLoader.load('outline', {
-  topic: state.topic,
-  minSections: config.minSections,
-  maxSections: config.maxSections,
-});
-```
-
-## Learning Objectives
-
-1. **Prompt Chaining**: Build complex outputs from simple steps
-2. **LangGraph**: State management in LLM workflows
-3. **Parallel Execution**: Research sections concurrently
-4. **Sequential Processing**: Write sections in order
-5. **State Transitions**: Track progress through workflow
-6. **Testing**: Mock LLMs for deterministic tests
-
-## Node Version
-
-Requires Node.js >= 22.0.0 for TypeScript strip-types support.
-
-## License
-
-MIT
