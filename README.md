@@ -4,6 +4,8 @@ This project is a conversational music recommender built with LangGraph and stru
 
 The project is intentionally small and explicit: each graph node has a clear responsibility, and the flow is designed to be easy to remember and explain.
 
+![LangChain project image](./asset/langchain.png)
+
 ## Main goal
 
 The system is not just a "chatbot" that answers a single message. It is a stateful recommendation flow that:
